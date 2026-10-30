@@ -27,14 +27,30 @@ jobs:
 
       - name: Check for new llama.cpp release
         id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          # Get latest release from llama.cpp
-          LATEST_RELEASE=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.tag_name')
-          RELEASE_HASH=$(curl -s https://api.github.com/repos/ggml-org/llama.cpp/releases/latest | jq -r '.target_commitish')
-          
-          echo "Latest llama.cpp release: $LATEST_RELEASE"
+          set -euo pipefail
+
+          # CHANGED: /releases/latest ignores pre-releases (and now points at
+          # non-build tags like v0.8.0). List recent releases instead, keep only
+          # real build tags (bNNNN), skip drafts, and take the highest number.
+          LATEST_RELEASE=$(gh api "repos/ggml-org/llama.cpp/releases?per_page=50" \
+            --jq '[.[] | select(.draft==false) | select(.tag_name | test("^b[0-9]+$")) | .tag_name]
+                  | sort_by(.[1:] | tonumber) | last')
+
+          if [ -z "$LATEST_RELEASE" ] || [ "$LATEST_RELEASE" = "null" ]; then
+            echo "Could not find a bNNNN release upstream" >&2
+            exit 1
+          fi
+
+          # CHANGED: target_commitish is often just "master" for these releases,
+          # so resolve the tag to an actual commit SHA.
+          RELEASE_HASH=$(gh api "repos/ggml-org/llama.cpp/commits/${LATEST_RELEASE}" --jq '.sha')
+
+          echo "Latest llama.cpp build: $LATEST_RELEASE"
           echo "Release hash: $RELEASE_HASH"
-          
+
           # Check if we've already built this release
           if git tag | grep -q "^${LATEST_RELEASE}$"; then
             echo "Release $LATEST_RELEASE already built"
@@ -48,7 +64,7 @@ jobs:
             echo "New release detected: $LATEST_RELEASE"
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
-          
+
           echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
           echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
 
@@ -61,20 +77,20 @@ jobs:
       matrix:
         cuda_version: ['12.8.1']
         arch:
-          # Native runners — no QEMU. nvidia/cuda:*-cudnn-devel-ubuntu22.04 is
-          # multi-arch on Docker Hub so the same build path runs on both.
+          # CHANGED: amd64 only (Kaggle is x86_64). Re-add the arm64 line if needed:
+          # - { suffix: arm64, runs_on: ubuntu-24.04-arm }
           - { suffix: amd64, runs_on: ubuntu-latest }
-          - { suffix: arm64, runs_on: ubuntu-24.04-arm }
         include:
           - cuda_version: '12.8.1'
             cuda_version_short: '12.8'
+            # Built inside an Ubuntu 22.04 container -> binaries need only glibc 2.35,
+            # so they run on Kaggle. Do NOT switch this to ubuntu24.04.
             cuda_tag: '12.8.1-cudnn-devel-ubuntu22.04'
-            # CUDA compute capabilities target the runtime GPU, not the host
-            # CPU arch, so the same list applies to both amd64 and arm64
-            # builds. Relevant aarch64 GPU contexts (Grace Hopper, Grace
-            # Blackwell, DGX Spark) are covered by sm_90 / sm_100 / sm_120.
-            architectures: '75-virtual;80-virtual;86-virtual;89-virtual;90-virtual;100-virtual;120-virtual'
-    
+            # CHANGED: Kaggle GPUs only: 60 = P100, 75 = T4. Plain numbers build real
+            # SASS + PTX. The original "-virtual" entries were PTX only, which the
+            # driver has to JIT-compile on first load (slow startup).
+            architectures: '60;75'
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -83,7 +99,7 @@ jobs:
         run: |
           echo "=== Initial Disk Space ==="
           df -h
-          
+
           echo "=== Removing unnecessary packages ==="
           sudo apt-get remove -y '^aspnetcore-.*' || true
           sudo apt-get remove -y '^dotnet-.*' --fix-missing || true
@@ -94,7 +110,7 @@ jobs:
           sudo apt-get remove -y azure-cli google-chrome-stable firefox powershell mono-devel libgl1-mesa-dri --fix-missing || true
           sudo apt-get autoremove -y || true
           sudo apt-get clean || true
-          
+
           echo "=== Removing large directories ==="
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
@@ -104,10 +120,10 @@ jobs:
           sudo rm -rf /usr/share/swift
           sudo rm -rf /usr/local/.ghcup
           sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          
+
           # Clean docker system
           docker system prune -af || true
-          
+
           echo "=== After Cleanup ==="
           df -h
 
@@ -115,26 +131,26 @@ jobs:
         run: |
           # Pull Docker image
           docker pull nvidia/cuda:${{ matrix.cuda_tag }}
-          
+
           # Run build in container
           docker run --rm \
             -v $PWD:/workspace \
             nvidia/cuda:${{ matrix.cuda_tag }} \
             bash -c "
               set -e
-              
+
               echo '=== Installing minimal dependencies ==='
               apt-get update -qq
               apt-get install -y --no-install-recommends git cmake ninja-build build-essential libssl-dev ca-certificates
               apt-get clean
               rm -rf /var/lib/apt/lists/*
-              
+
               echo '=== Cloning llama.cpp ==='
               cd /workspace
               git clone --depth 1 --branch ${{ needs.check-release.outputs.release_tag }} https://github.com/ggml-org/llama.cpp.git || \
                 (git clone https://github.com/ggml-org/llama.cpp.git && cd llama.cpp && git checkout ${{ needs.check-release.outputs.release_hash }})
               cd llama.cpp
-              
+
               echo '=== Configuring build with Ninja ==='
               export LIBRARY_PATH="/usr/local/cuda/lib64/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}"
 
@@ -150,10 +166,10 @@ jobs:
                 -DLLAMA_BUILD_EXAMPLES=OFF \
                 -DCMAKE_EXE_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs' \
                 -DCMAKE_SHARED_LINKER_FLAGS='-Wl,-rpath-link,/usr/local/cuda/lib64/stubs'
-              
+
               echo '=== Building with Ninja (parallel: all cores) ==='
               cmake --build build --config Release -j\$(nproc)
-              
+
               echo '=== Copying binaries ==='
               cd /workspace
               mkdir -p binaries/cuda-${{ matrix.cuda_version_short }}
@@ -173,17 +189,17 @@ jobs:
 
               echo '=== Build complete ==='
               ls -lh binaries/cuda-${{ matrix.cuda_version_short }}/
-              
+
               echo '=== Cleaning up build directory ==='
               rm -rf llama.cpp
             "
-          
+
           # Remove Docker image to free space
           docker rmi nvidia/cuda:${{ matrix.cuda_tag }} || true
-          
+
           # Fix permissions for files created by root in container
           sudo chown -R $(id -u):$(id -g) $PWD
-          
+
           echo "=== Final disk usage ==="
           df -h
 
@@ -229,12 +245,8 @@ jobs:
       - name: Create advancing release tag
         # GitHub sorts the /releases list by each release's created_at, which is
         # the *committer date of the tag's target commit* — not the publish
-        # time. Previously softprops/action-gh-release created every tag at the
-        # static main HEAD (unchanged since May 2026), so every release reported
-        # the same created_at and the /releases list stopped reflecting recency:
-        # API consumers polling the first page never saw newer builds. Anchor
-        # each tag to a fresh empty commit whose committer date is build time so
-        # created_at advances and new releases sort to the top of the list.
+        # time. Anchor each tag to a fresh empty commit whose committer date is
+        # build time so new releases sort to the top of the list.
         # The commit is reachable only via its tag; main is never pushed.
         run: |
           set -euo pipefail
@@ -253,37 +265,20 @@ jobs:
           name: llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA
           body: |
             # llama.cpp ${{ needs.check-release.outputs.release_tag }} with CUDA Support
-            
-            Pre-built binaries of llama.cpp with CUDA support for multiple CUDA versions.
-            
+
+            Linux x86_64 build (Ubuntu 22.04 compatible, glibc 2.35) for Kaggle-class GPUs.
+
             **Source:** https://github.com/ggml-org/llama.cpp/releases/tag/${{ needs.check-release.outputs.release_tag }}
             **Commit:** ${{ needs.check-release.outputs.release_hash }}
-            
-            ## CUDA Versions
-            - CUDA 12.8 - GPU compute capabilities: 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0
 
-            ## Host architectures
-            Tarballs are published per host CPU architecture (Linux):
-            - `-amd64.tar.gz` — x86_64 (most desktops, servers, cloud VMs)
-            - `-arm64.tar.gz` — aarch64 (Grace Hopper / Grace Blackwell / DGX Spark / Ampere Altra)
-
-            ## GPU compute capability reference
-            - 7.5: Tesla T4, RTX 20xx series, Quadro RTX
-            - 8.0: A100
-            - 8.6: RTX 3000 series
-            - 8.9: RTX 4000 series, L4, L40
-            - 9.0: H100, H200, GH200
-            - 10.0: B200, GB200
-            - 12.0: RTX Pro series, RTX 50xx
+            ## CUDA / GPUs
+            - CUDA 12.8
+            - Compute capabilities: 6.0 (Tesla P100), 7.5 (Tesla T4, RTX 20xx)
 
             ## Usage
-            Download the tarball matching your host CPU arch and CUDA version, then extract:
             ```bash
-            # amd64 host
             tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-amd64.tar.gz
-            # arm64 host (e.g. Grace Blackwell)
-            tar -xzf llama.cpp-${{ needs.check-release.outputs.release_tag }}-cuda-12.8-arm64.tar.gz
-            ./llama-cli --help
+            ./cuda-12.8/llama-cli --help
             ```
           files: release-assets/*
           draft: false
