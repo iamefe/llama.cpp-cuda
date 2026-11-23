@@ -2,15 +2,21 @@ name: Build llama.cpp with CUDA
 
 on:
   schedule:
-    # Run daily at 00:00 UTC
-    - cron: '0 0 * * *'
+    # Once daily. Off the top of the hour: GitHub delays/drops runs at :00.
+    - cron: '17 3 * * *'
   workflow_dispatch:
     inputs:
       force_build:
-        description: 'Force build even if no new release'
+        description: 'Force build even if no new release / already built today'
         required: false
         type: boolean
         default: false
+
+# Never run two builds at once; a second trigger waits, then hits the
+# same-day guard below and exits.
+concurrency:
+  group: build-llama-cuda
+  cancel-in-progress: false
 
 jobs:
   check-release:
@@ -29,32 +35,52 @@ jobs:
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          # Upstream now publishes both bNNNN and vX.Y.Z tags.
+          # Narrow this if you only want one line, e.g. '^v[0-9]+(\.[0-9]+)*$'
+          TAG_REGEX: '^(b[0-9]+|v[0-9]+(\.[0-9]+)*)$'
         run: |
           set -euo pipefail
 
-          # CHANGED: /releases/latest ignores pre-releases (and now points at
-          # non-build tags like v0.8.0). List recent releases instead, keep only
-          # real build tags (bNNNN), skip drafts, and take the highest number.
+          # /releases/latest ignores pre-releases, so list recent releases instead.
+          # bNNNN and vX.Y.Z numbers can't be compared with each other, so pick
+          # the most recently PUBLISHED release whose tag matches TAG_REGEX.
           LATEST_RELEASE=$(gh api "repos/ggml-org/llama.cpp/releases?per_page=50" \
-            --jq '[.[] | select(.draft==false) | select(.tag_name | test("^b[0-9]+$")) | .tag_name]
-                  | sort_by(.[1:] | tonumber) | last')
+            | jq -r --arg re "$TAG_REGEX" '
+                [.[] | select(.draft==false) | select(.tag_name | test($re))]
+                | sort_by(.published_at // .created_at)
+                | last | .tag_name // empty')
 
-          if [ -z "$LATEST_RELEASE" ] || [ "$LATEST_RELEASE" = "null" ]; then
-            echo "Could not find a bNNNN release upstream" >&2
+          if [ -z "$LATEST_RELEASE" ]; then
+            echo "Could not find a matching upstream release (regex: $TAG_REGEX)" >&2
             exit 1
           fi
 
-          # CHANGED: target_commitish is often just "master" for these releases,
-          # so resolve the tag to an actual commit SHA.
+          # Resolve the tag to an actual commit SHA.
           RELEASE_HASH=$(gh api "repos/ggml-org/llama.cpp/commits/${LATEST_RELEASE}" --jq '.sha')
 
           echo "Latest llama.cpp build: $LATEST_RELEASE"
           echo "Release hash: $RELEASE_HASH"
 
-          # Check if we've already built this release
-          if git tag | grep -q "^${LATEST_RELEASE}$"; then
+          echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
+          echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
+
+          FORCE="${{ github.event.inputs.force_build }}"
+
+          # Same-day guard: each build tag points at an empty commit dated at
+          # build time, so the newest tag's date is the last build date (UTC).
+          LAST_BUILD_DAY=$(git for-each-ref --sort=-creatordate \
+            --format='%(creatordate:short)' refs/tags | head -1)
+          TODAY=$(date -u +%F)
+          if [ "$LAST_BUILD_DAY" = "$TODAY" ] && [ "$FORCE" != "true" ]; then
+            echo "Already built today ($TODAY) - skipping"
+            echo "should_build=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Already built this exact release?
+          if git tag | grep -qx "${LATEST_RELEASE}"; then
             echo "Release $LATEST_RELEASE already built"
-            if [ "${{ github.event.inputs.force_build }}" = "true" ]; then
+            if [ "$FORCE" = "true" ]; then
               echo "Force build enabled, building anyway"
               echo "should_build=true" >> $GITHUB_OUTPUT
             else
@@ -65,9 +91,6 @@ jobs:
             echo "should_build=true" >> $GITHUB_OUTPUT
           fi
 
-          echo "release_tag=$LATEST_RELEASE" >> $GITHUB_OUTPUT
-          echo "release_hash=$RELEASE_HASH" >> $GITHUB_OUTPUT
-
   build:
     needs: check-release
     if: needs.check-release.outputs.should_build == 'true'
@@ -77,7 +100,7 @@ jobs:
       matrix:
         cuda_version: ['12.8.1']
         arch:
-          # CHANGED: amd64 only (Kaggle is x86_64). Re-add the arm64 line if needed:
+          # amd64 only (Kaggle is x86_64). Re-add the arm64 line if needed:
           # - { suffix: arm64, runs_on: ubuntu-24.04-arm }
           - { suffix: amd64, runs_on: ubuntu-latest }
         include:
@@ -86,9 +109,8 @@ jobs:
             # Built inside an Ubuntu 22.04 container -> binaries need only glibc 2.35,
             # so they run on Kaggle. Do NOT switch this to ubuntu24.04.
             cuda_tag: '12.8.1-cudnn-devel-ubuntu22.04'
-            # CHANGED: Kaggle GPUs only: 60 = P100, 75 = T4. Plain numbers build real
-            # SASS + PTX. The original "-virtual" entries were PTX only, which the
-            # driver has to JIT-compile on first load (slow startup).
+            # Kaggle GPUs only: 60 = P100, 75 = T4. Plain numbers build real
+            # SASS + PTX (the "-virtual" variants are PTX only and JIT on first load).
             architectures: '60;75'
 
     steps:
@@ -178,13 +200,13 @@ jobs:
               cp -r llama.cpp/build/bin/* binaries/cuda-${{ matrix.cuda_version_short }}/
 
               # Strip binaries to reduce size (executables only, not .so files)
-              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name "*.so*" -exec strip {} \; 2>/dev/null || true
+              find binaries/cuda-${{ matrix.cuda_version_short }}/ -type f -executable ! -name '*.so*' -exec strip {} \; 2>/dev/null || true
 
               echo '=== Creating version info ==='
               echo 'llama.cpp version: ${{ needs.check-release.outputs.release_tag }}' > binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'CUDA version: ${{ matrix.cuda_version }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'Architectures: ${{ matrix.architectures }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
-              echo 'Build date: '$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
+              echo 'Build date: '\$(date -u +%Y-%m-%d) >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
               echo 'Build hash: ${{ needs.check-release.outputs.release_hash }}' >> binaries/cuda-${{ matrix.cuda_version_short }}/VERSION.txt
 
               echo '=== Build complete ==='
@@ -212,8 +234,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          # Arch suffix in the artifact name so the matrix jobs do not collide
-          # in actions/download-artifact later.
+          # Arch suffix in the artifact name so matrix jobs do not collide.
           name: llama.cpp-cuda-${{ matrix.cuda_version_short }}-${{ matrix.arch.suffix }}
           path: binaries/*.tar.gz
           retention-days: 1
@@ -244,10 +265,10 @@ jobs:
 
       - name: Create advancing release tag
         # GitHub sorts the /releases list by each release's created_at, which is
-        # the *committer date of the tag's target commit* — not the publish
-        # time. Anchor each tag to a fresh empty commit whose committer date is
-        # build time so new releases sort to the top of the list.
-        # The commit is reachable only via its tag; main is never pushed.
+        # the committer date of the tag's target commit, not the publish time.
+        # Anchor each tag to a fresh empty commit dated at build time so new
+        # releases sort to the top. The same-day guard in check-release relies
+        # on this. The commit is reachable only via its tag; main is never pushed.
         run: |
           set -euo pipefail
           TAG="${{ needs.check-release.outputs.release_tag }}"
